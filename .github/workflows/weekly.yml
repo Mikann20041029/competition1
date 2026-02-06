@@ -1,405 +1,56 @@
-import os
-import json
-import re
-import time
-import datetime
-from urllib.parse import urljoin, urlparse
+name: weekly-opportunity-scan
 
-import requests
-from bs4 import BeautifulSoup
-from dateutil import parser as dtparser
-from openai import OpenAI
+on:
+  schedule:
+    - cron: "0 0 * * 1"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "scan or pack"
+        required: true
+        default: "scan"
+      selected_url:
+        description: "When mode=pack, paste the submission/source URL here"
+        required: false
+        default: ""
+      submission_type_hint:
+        description: "Optional hint: copy / naming / idea / essay / pitch / hackathon"
+        required: false
+        default: ""
 
-CONFIG_PATH = "config.json"
-UA = "Mozilla/5.0 (compatible; AutoContestBot/1.1; +https://github.com/)"
+permissions:
+  contents: write
 
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-if not DEEPSEEK_API_KEY:
-    raise RuntimeError("Missing env: DEEPSEEK_API_KEY")
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-MODE = (os.getenv("MODE") or "scan").strip().lower()
-SELECTED_URL = (os.getenv("SELECTED_URL") or "").strip()
-SUBMISSION_TYPE_HINT = (os.getenv("SUBMISSION_TYPE_HINT") or "").strip()
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+      - name: Run
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          MODE: ${{ github.event.inputs.mode }}
+          SELECTED_URL: ${{ github.event.inputs.selected_url }}
+          SUBMISSION_TYPE_HINT: ${{ github.event.inputs.submission_type_hint }}
+        run: |
+          python main.py
 
-def safe_get(url: str, timeout=30) -> str:
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=timeout)
-    r.raise_for_status()
-    return r.text
-
-def normalize_url(u: str) -> str:
-    u = (u or "").strip()
-    if not u:
-        return ""
-    parsed = urlparse(u)
-    return parsed._replace(fragment="").geturl()
-
-def ensure_dir(path: str):
-    if path:
-        os.makedirs(path, exist_ok=True)
-
-def looks_like_candidate(text: str, hints: list[str]) -> bool:
-    t = (text or "").lower()
-    score = 0
-    for h in hints:
-        if h.lower() in t:
-            score += 1
-    return score >= 1
-
-def extract_links(base_url: str, html: str, hints: list[str]) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for a in soup.find_all("a"):
-        href = a.get("href") or ""
-        label = (a.get_text(" ", strip=True) or "").strip()
-        if not href:
-            continue
-        abs_url = normalize_url(urljoin(base_url, href))
-        if not abs_url.startswith("http"):
-            continue
-        if any(x in abs_url.lower() for x in ["javascript:", "mailto:"]):
-            continue
-        blob = f"{label} {abs_url}"
-        if looks_like_candidate(blob, hints):
-            out.append({"url": abs_url, "label": label})
-
-    seen = set()
-    uniq = []
-    for x in out:
-        if x["url"] in seen:
-            continue
-        seen.add(x["url"])
-        uniq.append(x)
-    return uniq
-
-def fetch_page_excerpt(url: str, max_chars=9000) -> str:
-    html = safe_get(url)
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    text = soup.get_text("\n", strip=True)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text[:max_chars]
-
-def deepseek_json(prompt: str, temperature: float = 0.2) -> dict:
-    resp = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=temperature,
-    )
-    raw = resp.choices[0].message.content or "{}"
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not m:
-            return {}
-        return json.loads(m.group(0))
-
-def deepseek_text(prompt: str, temperature: float = 0.7) -> str:
-    resp = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=temperature,
-    )
-    return resp.choices[0].message.content or ""
-
-def parse_deadline(deadline_str: str):
-    if not deadline_str:
-        return None
-    s = deadline_str.strip()
-    try:
-        return dtparser.parse(s, fuzzy=True)
-    except Exception:
-        return None
-
-def score_item(item: dict) -> float:
-    conf = float(item.get("confidence") or 0.0)
-    reward = (item.get("reward") or "").lower()
-    required = (item.get("required_submission") or "").lower()
-    how = (item.get("how_to_submit") or "").lower()
-
-    s = 0.0
-    s += conf * 2.0
-
-    if any(x in reward for x in ["$", "usd", "eur", "gbp", "¥", "yen", "prize", "gift", "voucher", "amazon"]):
-        s += 1.0
-
-    if any(x in required for x in ["catch", "tagline", "slogan", "naming", "idea", "short", "tweet", "caption", "copy"]):
-        s += 1.0
-    if any(x in required for x in ["essay", "research", "prototype", "video", "portfolio", "business plan", "proposal"]):
-        s -= 0.8
-
-    if any(x in how for x in ["form", "online", "apply", "submit", "entry"]):
-        s += 0.6
-
-    dt = parse_deadline(item.get("deadline") or "")
-    if dt:
-        now = datetime.datetime.now(dt.tzinfo or datetime.timezone.utc)
-        delta_days = (dt - now).total_seconds() / 86400.0
-        if delta_days < -1:
-            s -= 2.0
-        elif delta_days < 7:
-            s += 0.6
-        elif delta_days < 30:
-            s += 0.4
-        else:
-            s += 0.1
-    return s
-
-def structurize_opportunity(url: str, label: str, page_text: str) -> dict:
-    prompt = f"""
-You extract contest/campaign/call-for-entry information from a webpage.
-
-Return STRICT JSON only (no markdown, no commentary).
-If unknown, use null or empty string. Do NOT invent facts.
-
-Fields:
-- title (string)
-- organizer (string)
-- reward (string)
-- deadline (string)
-- eligibility (string)
-- required_submission (string)
-- submission_format (string)
-- how_to_submit (string)
-- submission_url (string)
-- notes (string)
-- confidence (number 0-1)
-
-Input:
-- source_url: {url}
-- link_label: {label}
-
-Page text:
-{page_text}
-""".strip()
-
-    data = deepseek_json(prompt, temperature=0.2)
-    su = (data.get("submission_url") or "").strip()
-    data["submission_url"] = su if su.startswith("http") else url
-    data["_source_url"] = url
-    data["_link_label"] = label
-    data["_score"] = score_item(data)
-    return data
-
-def write_weekly_cards(items: list[dict], out_md: str):
-    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-    lines = []
-    lines.append(f"# Weekly Submission List ({now})")
-    lines.append("")
-    lines.append("※最終提出は手動でOK。ここに「提出URL」「要件」「締切」がまとまって出る。")
-    lines.append("")
-
-    for idx, it in enumerate(items[:30], 1):
-        title = (it.get("title") or it.get("_link_label") or it.get("_source_url") or "").strip()
-        sub_url = (it.get("submission_url") or it.get("_source_url") or "").strip()
-        src_url = (it.get("_source_url") or "").strip()
-
-        lines.append(f"## {idx}. {title}")
-        lines.append(f"- Score: {it.get('_score',0):.2f} / Confidence: {it.get('confidence',0)}")
-        lines.append(f"- Submission URL: {sub_url}")
-        if src_url and src_url != sub_url:
-            lines.append(f"- Source URL: {src_url}")
-        lines.append(f"- Deadline: {(it.get('deadline') or '').strip()}")
-        lines.append(f"- Reward: {(it.get('reward') or '').strip()}")
-        lines.append(f"- Eligibility: {(it.get('eligibility') or '').strip()}")
-        lines.append(f"- Required submission: {(it.get('required_submission') or '').strip()}")
-        lines.append(f"- Submission format: {(it.get('submission_format') or '').strip()}")
-        lines.append(f"- How to submit: {(it.get('how_to_submit') or '').strip()}")
-        notes = (it.get("notes") or "").strip()
-        if notes:
-            lines.append(f"- Notes: {notes}")
-        lines.append("")
-    ensure_dir(os.path.dirname(out_md))
-    with open(out_md, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-def generate_submission_pack(op: dict, page_text: str, out_path: str):
-    title = (op.get("title") or "").strip() or "Untitled Opportunity"
-    required = (op.get("required_submission") or "").strip()
-    fmt = (op.get("submission_format") or "").strip()
-    how = (op.get("how_to_submit") or "").strip()
-    deadline = (op.get("deadline") or "").strip()
-    reward = (op.get("reward") or "").strip()
-    submission_url = (op.get("submission_url") or op.get("_source_url") or "").strip()
-    src_url = (op.get("_source_url") or "").strip()
-
-    # 1) classify submission type
-    classify_prompt = f"""
-Classify what kind of submission this opportunity wants.
-Return STRICT JSON only.
-
-Fields:
-- submission_type: one of ["copy","naming","idea","essay","pitch","hackathon","photo","design","unknown"]
-- detected_constraints: string
-- must_avoid: string  // e.g. "AI prohibited", "original only", "max 100 chars"
-- confidence: number 0-1
-
-Hints:
-- If it's slogan/tagline/copy -> "copy"
-- If it's name -> "naming"
-- If it's short concept -> "idea"
-- If it's proposal/business plan -> "pitch"
-- If it's code/prototype -> "hackathon"
-
-User hint (optional): {SUBMISSION_TYPE_HINT}
-
-Opportunity summary:
-Title: {title}
-Required submission: {required}
-Submission format: {fmt}
-How to submit: {how}
-Deadline: {deadline}
-Reward: {reward}
-
-Page text excerpt:
-{page_text[:7000]}
-""".strip()
-    cls = deepseek_json(classify_prompt, temperature=0.2)
-    stype = (cls.get("submission_type") or "unknown").strip()
-
-    # 2) generate pack depending on type
-    gen_prompt = f"""
-You are helping a user submit to a competition. Produce a ready-to-paste submission pack.
-
-Hard rules:
-- DO NOT invent facts about the organizer, rules, or requirements.
-- Only create the actual submission text that the user will paste.
-- Create multiple variants (so the user can choose).
-- Keep within common constraints if mentioned; otherwise keep it concise.
-- Output in Japanese if the opportunity appears Japanese; otherwise English.
-
-Opportunity:
-Title: {title}
-Submission URL: {submission_url}
-Deadline: {deadline}
-Reward: {reward}
-Required submission: {required}
-Submission format: {fmt}
-How to submit: {how}
-
-Detected submission type: {stype}
-Detected constraints: {cls.get("detected_constraints","")}
-Must avoid: {cls.get("must_avoid","")}
-
-Now generate:
-1) A checklist of what the user must fill on the form (fields likely required)
-2) The submission content:
-   - If type=copy: 15 taglines + 3 long versions + 1 final recommended
-   - If type=naming: 20 names + reasoning for top 5
-   - If type=idea: 10 ideas (each: title + 150-250 words) + top 3 expanded
-   - If type=essay: 3 outlines + 1 full draft (under 800 words unless told otherwise)
-   - If type=pitch: 1-page pitch (problem/solution/market/why now) + 5 bullet variants
-   - If type=hackathon: project concept + MVP scope + repo README skeleton
-   - If type=photo/design: only propose concepts + captions (do not generate images)
-
-3) A short “final paste version” (the best candidate) clearly separated.
-
-Return as Markdown.
-""".strip()
-
-    pack_md = deepseek_text(gen_prompt, temperature=0.7)
-
-    lines = []
-    lines.append(f"# Submission Pack")
-    lines.append("")
-    lines.append(f"- Title: {title}")
-    lines.append(f"- Submission URL: {submission_url}")
-    if src_url and src_url != submission_url:
-        lines.append(f"- Source URL: {src_url}")
-    lines.append(f"- Deadline: {deadline}")
-    lines.append(f"- Reward: {reward}")
-    lines.append(f"- Required submission: {required}")
-    lines.append(f"- Submission format: {fmt}")
-    lines.append(f"- How to submit: {how}")
-    lines.append(f"- Type: {stype} (confidence: {cls.get('confidence','')})")
-    if cls.get("must_avoid"):
-        lines.append(f"- Must avoid: {cls.get('must_avoid')}")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append(pack_md.strip())
-
-    ensure_dir(os.path.dirname(out_path))
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-def run_scan():
-    cfg = load_config()
-    sources = cfg["sources"]
-    hints = cfg.get("keyword_hints", [])
-    max_candidates = int(cfg.get("max_candidates", 40))
-    out_md = cfg.get("output_markdown", "output/weekly_cards.md")
-
-    candidates = []
-    for src in sources:
-        try:
-            html = safe_get(src)
-            links = extract_links(src, html, hints)
-            candidates.extend(links)
-            time.sleep(1.0)
-        except Exception as e:
-            candidates.append({"url": src, "label": f"[source fetch failed] {e}"})
-
-    # de-dupe
-    seen = set()
-    uniq = []
-    for c in candidates:
-        u = normalize_url(c.get("url", ""))
-        if not u or u in seen:
-            continue
-        seen.add(u)
-        uniq.append({"url": u, "label": c.get("label", "")})
-    candidates = uniq[:max_candidates]
-
-    items = []
-    for c in candidates:
-        url = c["url"]
-        label = c.get("label", "")
-        try:
-            page_text = fetch_page_excerpt(url)
-            items.append(structurize_opportunity(url, label, page_text))
-        except Exception as e:
-            items.append({
-                "title": label or url,
-                "_source_url": url,
-                "submission_url": url,
-                "notes": f"failed: {e}",
-                "confidence": 0.0,
-                "_score": -99.0
-            })
-        time.sleep(1.2)
-
-    items.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
-    write_weekly_cards(items, out_md)
-    print(f"[OK] wrote: {out_md}")
-
-def run_pack():
-    if not SELECTED_URL:
-        raise RuntimeError("MODE=pack requires SELECTED_URL env (workflow_dispatch input selected_url).")
-
-    url = normalize_url(SELECTED_URL)
-    page_text = fetch_page_excerpt(url)
-
-    # First structurize from the selected page itself
-    op = structurize_opportunity(url, "selected_url", page_text)
-
-    # Generate pack
-    out_path = "output/submission_pack.md"
-    generate_submission_pack(op, page_text, out_path)
-    print(f"[OK] wrote: {out_path}")
-
-def main():
-    if MODE == "pack":
-        run_pack()
-    else:
-        run_scan()
-
-if __name__ == "__main__":
-    main()
+      - name: Commit output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/weekly_cards.md output/submission_pack.md
+          git diff --cached --quiet || git commit -m "auto: update scan/pack"
+          git push
