@@ -2,8 +2,21 @@ name: weekly-opportunity-scan
 
 on:
   schedule:
-    - cron: "0 0 * * 1" # 毎週月曜 00:00 UTC（日本時間だと月曜朝）
+    - cron: "0 0 * * 1"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "scan or pack"
+        required: true
+        default: "scan"
+      selected_url:
+        description: "When mode=pack, paste the submission/source URL here"
+        required: false
+        default: ""
+      submission_type_hint:
+        description: "Optional hint: copy / naming / idea / essay / pitch / hackathon"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -25,9 +38,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scanner
+      - name: Run
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          MODE: ${{ github.event.inputs.mode }}
+          SELECTED_URL: ${{ github.event.inputs.selected_url }}
+          SUBMISSION_TYPE_HINT: ${{ github.event.inputs.submission_type_hint }}
         run: |
           python main.py
 
@@ -35,6 +51,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output/weekly_cards.md
-          git diff --cached --quiet || git commit -m "weekly: update opportunities"
+          git add output/weekly_cards.md output/submission_pack.md
+          git diff --cached --quiet || git commit -m "auto: update scan/pack"
           git push
